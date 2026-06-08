@@ -1,0 +1,453 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+C_LIGHT  = 3e8           # m/s
+LAMBDA_0 = 1.55e-6       # m, Er:Yb:glass wavelength
+NU_0     = C_LIGHT / LAMBDA_0  # ~193 THz optical carrier
+
+F_LOW_IPN  = 1.0         # Hz  — paper integrates from 1 Hz
+F_HIGH_IPN = 3e6         # Hz  — to 3 MHz
+
+# Expected values from Lemons et al. f
+IPN_EXPECTED_MRAD  = 3.5   # mrad  (1 Hz – 3 MHz)
+JITTER_EXPECTED_AS = 2.9   # attoseconds
+
+# =============================================================================
+# STEP 1: ANCHOR POINTS
+# =============================================================================
+# Read these off the BLUE f_OOL curve in Lemons et al. Fig. 3.
+# Left y-axis is PND in rad Hz^{-1/2}, i.e. sqrt(S_phi(f)).
+# x-axis is Frequency in Hz (log scale).
+#
+# Pick values at decade boundaries where the log axis is unambiguous.
+# Read to the nearest half-decade on the y-axis — precision beyond
+# that is not meaningful given figure resolution.
+#
+# The blue f_OOL curve has two clear regions:
+#   1. Steep drop from 1 Hz to ~1e3 Hz
+#   2. Flat white noise floor from ~1e3 Hz to 3 MHz at ~1e-5 rad Hz^{-1/2}
+#      (revised down from initial estimate of 2e-5 after examining
+#       a higher-resolution version of the published figure)
+#
+# Start anchor points at 1 Hz matching the paper's IPN integration bound.
+# The sub-1 Hz behavior is excluded by the authors (attributed to quantum noise).
+#
+# Readings from the figure:
+#
+#   f (Hz)  |  sqrt(S_phi)  (rad Hz^{-1/2})
+#   --------|-------------------------------
+#   1       |  ~2e-4        (steep 1/f region)
+#   10      |  ~6e-5
+#   100     |  ~3e-5
+#   1e3     |  ~2e-5        (transition to floor)
+#   1e4     |  ~1e-5        (floor — revised from 1.5e-5)
+#   1e5     |  ~1e-5        (floor)
+#   1e6     |  ~1e-5        (floor)
+#
+# Note: the orange Integrated PND curve reads ~3.5 mrad at 1 Hz on the
+# right axis of Fig. 3. This is the paper's own internal reference for what
+# the integral should yield. Our reconstruction yields ~25 mrad over the
+# same band — the discrepancy is the central finding of this analysis.
+
+ANCHOR_F = np.array([
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6
+])  # Hz — starts at 1 Hz, matching paper's integration bound
+
+ANCHOR_PND = np.array([
+    # FILL IN from Fig. 3 blue f_OOL curve, in rad Hz^{-1/2}
+    # e.g. 5e-1, 2e-4, 5e-5, 2e-5, 1e-5, 8e-6, 4e-6
+    2e-4, 6e-5, 3e-5, 2e-5, 1e-5, 1e-5, 1e-5
+])  # rad Hz^{-1/2}
+
+# =============================================================================
+# STEP 2: POWER-LAW PND MODEL
+# =============================================================================
+# Model: sqrt(S_phi(f)) = sqrt( h0*f^a0 + h1*f^a1 + h2*f^a2 )
+# i.e.   S_phi(f)       =       h0*f^a0 + h1*f^a1 + h2*f^a2
+#
+# Three terms cover the three visible regions in the figure:
+#   Term 1 (a ~ -2 to -1): steep low-frequency 1/f or 1/f^2 rise
+#   Term 2 (a ~ -1 to 0):  mid-frequency flicker
+#   Term 3 (a ~  0):       high-frequency white phase noise floor
+
+def pnd_model_sqrt(f, h0, a0, h1):
+    """
+    Two-term power-law model for sqrt(S_phi(f)) in rad Hz^{-1/2}:
+
+        sqrt(S_phi(f)) = sqrt( h0*f^a0 + h1 )
+
+    Term 1 (h0, a0): low-frequency slope (1/f or 1/f^2 noise)
+    Term 2 (h1):     flat white phase noise floor (a=0, constant)
+
+    This matches the observed blue f_OOL curve in Lemons Fig. 3:
+    steep fall from 1-1000 Hz, flat floor above ~1 kHz at ~2e-5.
+    """
+    S = h0 * f**a0 + h1
+    S = np.maximum(S, 1e-30)
+    return np.sqrt(S)
+
+
+def fit_pnd_model(f_anchor, pnd_anchor):
+    """
+    Fit a 2-term power-law model to anchor points.
+
+    Parameters
+    ----------
+    f_anchor   : array, frequency [Hz]
+    pnd_anchor : array, sqrt(S_phi) [rad Hz^{-1/2}]
+
+    Returns
+    -------
+    popt       : fitted parameters [h0, a0, h1]
+    f_dense    : dense frequency grid for evaluation
+    pnd_dense  : model sqrt(S_phi) on f_dense  [rad Hz^{-1/2}]
+    S_phi_dense: model S_phi on f_dense         [rad^2/Hz]
+    """
+    # Initial guess:
+    #   h0*f^a0 : low-freq noise term, starts ~(2e-4)^2 at 1 Hz
+    #   h1      : white floor, ~(2e-5)^2
+    # [h0,     a0,    h1    ]
+    p0     = [4e-8,  -2.0,  4e-10]
+    bounds = (
+        [1e-20, -4.0,  1e-20],   # lower
+        [1e+2,   0.0,  1e-6 ]    # upper — h1 ceiling keeps floor physical
+    )
+
+    try:
+        popt, _ = curve_fit(
+            pnd_model_sqrt,
+            f_anchor, pnd_anchor,
+            p0=p0, bounds=bounds,
+            maxfev=20000
+        )
+        print("Power-law fit converged (2-term model).")
+        print(f"  Low-freq term : h0={popt[0]:.3e},  alpha={popt[1]:.2f}")
+        print(f"  White floor   : h1={popt[2]:.3e}  "
+              f"=> floor = {np.sqrt(popt[2]):.2e} rad Hz^{{-1/2}}")
+    except RuntimeError:
+        print("WARNING: curve_fit did not converge — using initial guess.")
+        print("Manually tune p0 in fit_pnd_model() to improve the fit.")
+        popt = p0
+
+    # Evaluation grid runs from anchor min to 3 MHz — the paper's stated
+    # integration upper bound — regardless of where the anchor points stop.
+    # The parametric model can be evaluated anywhere; extending beyond the
+    # anchor range is valid because the floor term h1 dominates above ~1 kHz,
+    # which is confirmed by the flat region visible in Lemons Fig. 3.
+    F_INTEGRATION_MAX = 3e6   # Hz — paper's stated upper bound
+    f_dense     = np.logspace(
+        np.log10(f_anchor.min()),
+        np.log10(F_INTEGRATION_MAX),
+        10000   # finer grid for accurate integration over wide band
+    )
+    pnd_dense   = pnd_model_sqrt(f_dense, *popt)
+    S_phi_dense = pnd_dense**2    # rad^2/Hz
+
+    return popt, f_dense, pnd_dense, S_phi_dense
+
+
+# =============================================================================
+# STEP 3: REPRODUCE PAPER'S IPN AND TIMING JITTER
+# =============================================================================
+# The paper reports:
+#   IPN = 3.5 mrad  (integrated 1 Hz to 3 MHz)
+#   timing jitter   = 2.9 as  at 1.55 µm
+#
+# IPN is defined as (Lemons eq. 4):
+#   IPN = sqrt( 2 * integral( S_phi(f), f_low, f_high ) )
+#
+# Timing jitter:
+#   delta_t = IPN / (2 * pi * nu_0)
+#
+# Note on the factor of 2:
+#   The paper follows the convention (Riley & Howe NIST SP-1065, IEEE 1139)
+#   where IPN = sqrt(2 * integral(L(f))) and L(f) = S_phi(f)/2.
+#   Since our S_phi is the two-sided PSD, the factor of 2 is retained.
+#   The check will flag if this assumption is wrong.
+
+def sanity_check(f, S_phi, nu_0, f_low, f_high,
+                 ipn_expected_mrad, jitter_expected_as,
+                 floor_pnd):
+    """
+    Integrate S_phi over [f_low, f_high] and compare to paper values.
+    Also computes a model-free floor-only estimate as an independent check.
+
+    Parameters
+    ----------
+    f         : frequency array [Hz]
+    S_phi     : phase noise PSD [rad^2/Hz]
+    nu_0      : optical carrier frequency [Hz]
+    f_low/high: integration bounds [Hz]
+    ipn_expected_mrad  : paper's reported IPN [mrad]
+    jitter_expected_as : paper's reported jitter [as]
+    floor_pnd : directly observed floor value [rad Hz^{-1/2}]
+                used for the model-free estimate
+    """
+    # --- Full model integral ---
+    mask = (f >= f_low) & (f <= f_high)
+    f_actual_max = f[mask].max()
+    IPN       = np.sqrt(2 * np.trapezoid(S_phi[mask], f[mask]))
+    jitter_as = IPN / (2 * np.pi * nu_0) * 1e18
+
+    # --- Model-free floor-only estimate ---
+    # Uses only the visually observed floor value and the paper's own
+    # Eq. 4 formula — no fit, no model assumptions.
+    # Floor dominates from ~1 kHz to f_high.
+    floor_band = f_high - 1e3
+    IPN_floor  = np.sqrt(2 * (floor_pnd**2) * floor_band)
+
+    print()
+    print("=" * 55)
+    print("CHECK — IPN and timing jitter")
+    print("=" * 55)
+    print(f"  Requested band    : {f_low:.0f} Hz – {f_high/1e6:.0f} MHz")
+    print(f"  Actual upper limit: {f_actual_max:.3e} Hz")
+    print()
+    print(f"  --- Full model integral ---")
+    print(f"  IPN computed      : {IPN*1e3:.2f} mrad")
+    print(f"  IPN expected      : {ipn_expected_mrad:.2f} mrad")
+    print(f"  Jitter computed   : {jitter_as:.2f} as")
+    print(f"  Jitter expected   : {jitter_expected_as:.2f} as")
+    print(f"  Discrepancy factor: {IPN*1e3/ipn_expected_mrad:.1f}×")
+    print()
+    print(f"  --- Model-free floor-only estimate ---")
+    print(f"  Floor PND reading : {floor_pnd:.1e} rad Hz^{{-1/2}}")
+    print(f"  Floor band        : 1 kHz – {f_high/1e6:.0f} MHz = {floor_band:.2e} Hz")
+    print(f"  IPN_floor = sqrt(2 * ({floor_pnd:.1e})^2 * {floor_band:.2e})")
+    print(f"            = {IPN_floor*1e3:.1f} mrad")
+    print(f"  Discrepancy factor: {IPN_floor*1e3/ipn_expected_mrad:.1f}×")
+    print()
+
+    ipn_err = abs(IPN*1e3 - ipn_expected_mrad) / ipn_expected_mrad * 100
+    if ipn_err > 20:
+        print(f"  WARNING: {ipn_err:.0f}% discrepancy between computed and")
+        print(f"  reported IPN. This is the finding of the critique.")
+    else:
+        print(f"  Within 20% of paper values.")
+    print()
+
+    return IPN, jitter_as
+
+
+# =============================================================================
+# STEP 4: PND -> ALLAN DEVIATION
+# =============================================================================
+# Conversion from S_phi(f) [rad^2/Hz] to Allan deviation sigma_y(tau):
+#
+#   sigma_y^2(tau) = 2 * integral( S_y(f) * sin^4(pi*f*tau) / (pi*f*tau)^2 df )
+#
+# where the fractional frequency PSD is:
+#   S_y(f) = (f / nu_0)^2 * S_phi(f)
+#
+# Reference: Riley & Howe, NIST SP-1065 (2008)
+#            — already cited as ref [21] in Lemons et al.
+
+def pnd_to_adev(f, S_phi, nu_0, tau_arr):
+    """
+    Convert phase noise PSD S_phi(f) [rad^2/Hz] to
+    overlapping Allan deviation sigma_y(tau).
+
+    Parameters
+    ----------
+    f       : frequency array [Hz]
+    S_phi   : phase noise PSD [rad^2/Hz]  (= PND^2)
+    nu_0    : optical carrier frequency [Hz]
+    tau_arr : averaging times to evaluate [s]
+
+    Returns
+    -------
+    sigma_y : Allan deviation at each tau [dimensionless]
+    S_y     : fractional frequency noise PSD [1/Hz]
+    """
+    # Fractional frequency noise PSD
+    S_y = (f / nu_0)**2 * S_phi
+
+    sigma_y = np.zeros(len(tau_arr))
+
+    for i, tau in enumerate(tau_arr):
+        pf = np.pi * f * tau
+        # AVAR transfer function: sin^4(pi*f*tau) / (pi*f*tau)^2
+        # Handle f -> 0 limit (kernel -> 0 there anyway)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            kernel = np.where(
+                pf > 1e-10,
+                np.sin(pf)**4 / pf**2,
+                0.0
+            )
+        integrand  = S_y * kernel
+        integral   = np.trapezoid(integrand, f)
+        sigma_y[i] = np.sqrt(2 * integral) if integral > 0 else np.nan
+
+    return sigma_y, S_y
+
+
+# =============================================================================
+# STEP 5: REFERENCE SLOPE LINES
+# =============================================================================
+
+def add_slope_lines(ax, tau_anchor, sigma_anchor):
+    """
+    Overlay standard noise-type slope lines on a log-log ADEV plot.
+    Anchored at (tau_anchor, sigma_anchor).
+    """
+    tau_range = np.array([tau_anchor * 1e-2, tau_anchor * 1e2])
+    noise_types = [
+        ('White phase  (τ⁻¹)',    -1.0,  'silver', '--'),
+        ('White freq   (τ⁻½)',    -0.5,  'silver', ':'),
+        ('Flicker freq (τ⁰)',      0.0,  'silver', '-.'),
+        ('Random walk  (τ⁺½)',    +0.5,  'silver', (0, (3, 1, 1, 1))),
+    ]
+    for label, slope, color, ls in noise_types:
+        s = sigma_anchor * (tau_range / tau_anchor)**slope
+        ax.loglog(tau_range, s,
+                  color=color, linestyle=ls,
+                  linewidth=0.9, alpha=0.7, label=label)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+
+    # Guard: require anchor data before running
+    if len(ANCHOR_PND) == 0:
+        print("ANCHOR_PND is empty.")
+        print("Fill in values read from the blue f_OOL curve in")
+        print("Lemons et al. Fig. 3 (y-axis: rad Hz^{-1/2}).")
+        return
+
+    if len(ANCHOR_F) != len(ANCHOR_PND):
+        print("ANCHOR_F and ANCHOR_PND must have the same length.")
+        return
+
+    # ------------------------------------------------------------------
+    # Step 2: Fit power-law model to anchor points
+    # ------------------------------------------------------------------
+    popt, f_dense, pnd_dense, S_phi_dense = fit_pnd_model(
+        ANCHOR_F, ANCHOR_PND
+    )
+
+    # ------------------------------------------------------------------
+    # Step 3: Sanity check against paper values
+    # ------------------------------------------------------------------
+    IPN, jitter_as = sanity_check(
+        f_dense, S_phi_dense, NU_0,
+        F_LOW_IPN, F_HIGH_IPN,
+        IPN_EXPECTED_MRAD, JITTER_EXPECTED_AS,
+        floor_pnd=ANCHOR_PND[-1]   # last anchor point = floor reading
+    )
+
+    # ------------------------------------------------------------------
+    # Step 4: Compute Allan deviation
+    # ------------------------------------------------------------------
+    # tau range: shortest meaningful tau = 1/f_high = 1/3MHz ~ 330 ns
+    # longest tau = 1/f_low = 1/1Hz = 10 s (limited by 1 Hz anchor)
+    # f_dense now extends to 3 MHz so the ADEV integral is accurate
+    # at short averaging times down to ~330 ns.
+    tau_min = 1.0 / F_HIGH_IPN   # ~330 ns at 3 MHz
+    tau_max = 1.0 / 0.1          # 10 s
+    tau_arr = np.logspace(np.log10(tau_min), np.log10(tau_max), 400)
+
+    print("Computing Allan deviation... ", end='', flush=True)
+    sigma_y, S_y = pnd_to_adev(f_dense, S_phi_dense, NU_0, tau_arr)
+    print("done.")
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(
+        'CEP stabilization noise analysis — Er:Yb:glass FF scheme\n'
+        'Lemons et al., Opt. Lett. 44, 5610 (2019)',
+        fontsize=11
+    )
+
+    # --- Plot A: Reconstructed PND ---
+    ax = axes[0]
+    ax.loglog(f_dense, pnd_dense,
+              color='royalblue', linewidth=1.8,
+              label='Power-law model fit')
+    ax.loglog(ANCHOR_F, ANCHOR_PND,
+              'o', color='red', markersize=7, zorder=5,
+              label='Anchor points (read from Fig. 3)')
+    ax.set_xlabel('Frequency (Hz)', fontsize=11)
+    ax.set_ylabel(r'PND  (rad Hz$^{-1/2}$)', fontsize=11)
+    ax.set_title('Reconstructed PND\n'
+                 r'Blue $f_{OOL}$ curve, Lemons Fig. 3')
+    ax.legend(fontsize=8)
+    ax.grid(True, which='both', alpha=0.3)
+
+    # Annotate IPN result
+    ax.text(0.05, 0.05,
+            f'IPN (1 Hz–3 MHz): {IPN*1e3:.2f} mrad\n'
+            f'Timing jitter: {jitter_as:.2f} as',
+            transform=ax.transAxes,
+            fontsize=8, verticalalignment='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightyellow',
+                      alpha=0.8))
+
+    # --- Plot B: S_y(f) intermediate diagnostic ---
+    ax = axes[1]
+    ax.loglog(f_dense, S_y,
+              color='darkorange', linewidth=1.8)
+    ax.set_xlabel('Frequency (Hz)', fontsize=11)
+    ax.set_ylabel(r'$S_y(f)$  (Hz$^{-1}$)', fontsize=11)
+    ax.set_title('Fractional frequency\nnoise PSD $S_y(f)$')
+    ax.grid(True, which='both', alpha=0.3)
+
+    # Annotate noise regions
+    ax.text(0.05, 0.85, '1/f region',
+            transform=ax.transAxes, fontsize=8, color='grey')
+    ax.text(0.55, 0.50, 'White floor',
+            transform=ax.transAxes, fontsize=8, color='grey')
+
+    # --- Plot C: Allan deviation ---
+    ax = axes[2]
+
+    # Reference slope lines anchored at tau = 1e-3 s
+    idx_anchor   = np.argmin(np.abs(tau_arr - 1e-3))
+    sigma_anchor = sigma_y[idx_anchor]
+    if np.isfinite(sigma_anchor):
+        add_slope_lines(ax, tau_arr[idx_anchor], sigma_anchor)
+
+    ax.loglog(tau_arr, sigma_y,
+              color='royalblue', linewidth=2.2, zorder=5,
+              label=r'FF-only CEP stability ($f_{OOL}$, Lemons 2019)')
+
+    # Annotate the timing jitter floor
+    # Find approximate floor (minimum of sigma_y)
+    valid       = np.isfinite(sigma_y)
+    if valid.any():
+        idx_min     = np.nanargmin(sigma_y)
+        tau_floor   = tau_arr[idx_min]
+        sigma_floor = sigma_y[idx_min]
+        ax.annotate(
+            f'Floor ≈ {sigma_floor:.2e}\n'
+            f'(cf. {jitter_as:.1f} as jitter)',
+            xy=(tau_floor, sigma_floor),
+            xytext=(tau_floor * 5, sigma_floor * 5),
+            arrowprops=dict(arrowstyle='->', color='black', lw=0.8),
+            fontsize=8
+        )
+
+    ax.set_xlabel('Averaging time τ (s)', fontsize=11)
+    ax.set_ylabel(r'Allan deviation $\sigma_y(\tau)$', fontsize=11)
+    ax.set_title('CEP Allan deviation\nFF-only scheme (Lemons 2019)')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, which='both', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('/mnt/user-data/outputs/cep_noise_analysis.png',
+                dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Figure saved to cep_noise_analysis.png")
+
+
+if __name__ == '__main__':
+    main()
