@@ -35,7 +35,7 @@ at the seven frequencies in ANCHOR_F (1, 10, 100, 1k, 10k, 100k,
 
 The reconstructed model integrates to ~45 mrad over 1 Hz to 3 MHz,
 versus the paper's reported 3.5 mrad. The discrepancy and its
-analysis are discussed in the review paper and supplementary report.
+analysis are discussed in the review paper.
 
 ## Dependencies
 
